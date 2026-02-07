@@ -2,8 +2,12 @@
 # Lipid Heatmap #
 #################
 # Values is used for message display before and after data process
-values <- reactiveValues(runProcessClicked = FALSE)
-
+values <- reactiveValues(
+  runProcessClicked = FALSE,
+  removed_data = NULL,
+  grouped_data_frames = NULL,
+  lipid_names = NULL
+)
 
 
 # Create the inputs once; we will update their choices/selected later
@@ -124,7 +128,7 @@ observeEvent(input$run_process, {
   # (Uncomment your preferred cleaning functions here as needed)
   
   # Used to show which data is being filtered away
-  removed_data <<- remove_patterned_rows(data)
+  values$removed_data <- remove_patterned_rows(data)  
   
   # Filter rows based on pattern
   data <- filter_data_by_pattern(data)
@@ -206,32 +210,28 @@ observeEvent(input$run_process, {
   # Heatmap input selection  
   observeEvent(input$run_process, {
     processed_results <- process_lipid_data(sequence, data)
-    grouped_data_frames <<- create_grouped_data_frames(sequence, data)
+    values$grouped_data_frames <- create_grouped_data_frames(sequence, data)
     
     compound_names <- data[[1]]  # Extract the first column which contains compound names
     
     # Assuming that each grouped data frame has rows in the same order as "data"
-    for (i in seq_along(grouped_data_frames)) {
-      grouped_data_frames[[i]] <- cbind(Compound_Name = compound_names, grouped_data_frames[[i]])
+    for (i in seq_along(values$grouped_data_frames)) {
+      values$grouped_data_frames[[i]] <- cbind(Compound_Name = compound_names, values$grouped_data_frames[[i]])
     }
     
     # Extract unique group names from sequence
     unique_group_names <- unique(sequence[sequence$labels == "Sample", "group"])
     
     # Check if lengths of group names and grouped data frames match
-    if (length(unique_group_names) == length(grouped_data_frames)) {
+    if (length(unique_group_names) == length(values$grouped_data_frames)) {
       # Apply the actual group names from the sequence file
-      names(grouped_data_frames) <- unique_group_names
+      names(values$grouped_data_frames) <- unique_group_names
     } else {
       # If there's a mismatch, fallback to naming with numbers as before
-      names(grouped_data_frames) <- paste("Group", seq_along(grouped_data_frames))
+      names(values$grouped_data_frames) <- paste("Group", seq_along(values$grouped_data_frames))
     }
     
-    
-    
-    
-    # --- after grouped_data_frames is ready and names(...) are set ---
-    choices <- names(grouped_data_frames)
+    choices <- names(values$grouped_data_frames)
     
     # fallbacks if previous selection isn’t available in this dataset
     sel_num <- if (!is.null(values$last_num) && values$last_num %in% choices) {
@@ -258,9 +258,9 @@ observeEvent(input$run_process, {
     
     # Create interactive table for selected numerator group. Displayed at the starting page of the 'Lipid Heatmap'
     output$numerator_group_table <- DT::renderDataTable({
-      req(input$selected_group_for_numerator) 
+      req(input$selected_group_for_numerator, values$grouped_data_frames) 
       # Create a copy of the data for display purposes
-      display_data <- grouped_data_frames[[input$selected_group_for_numerator]]
+      display_data <- values$grouped_data_frames[[input$selected_group_for_numerator]]
       
       DT::datatable(
         display_data,  
@@ -270,8 +270,8 @@ observeEvent(input$run_process, {
     
     # Create interactive table for selected denominator group
     output$denominator_group_table <- DT::renderDataTable({
-      req(input$selected_group_for_denominator)  
-      display_data <- grouped_data_frames[[input$selected_group_for_denominator]]
+      req(input$selected_group_for_denominator, values$grouped_data_frames)  
+      display_data <- values$grouped_data_frames[[input$selected_group_for_denominator]]
       
       DT::datatable(
         display_data,  
@@ -282,10 +282,10 @@ observeEvent(input$run_process, {
     
     output$select_lipid_ui <- renderUI({
       # Extract lipid classes from the first column of the current data
-      lipid_names <<- group_lipids_by_group(data)
+      values$lipid_names <- group_lipids_by_group(data)
       
       # Available choices
-      choices <- c("All", sort(unique(lipid_names$group)))
+      choices <- c("All", sort(unique(values$lipid_names$group)))
       
       # Try to restore previous selection, but only keep items that still exist
       selected <- values$last_lipids
@@ -325,8 +325,9 @@ observeEvent(input$run_process, {
     reactiveP_value <- reactive({
       req(input$selected_group_for_numerator, input$selected_group_for_denominator)
       
-      numerator_data <- grouped_data_frames[[input$selected_group_for_numerator]]
-      denominator_data <- grouped_data_frames[[input$selected_group_for_denominator]]
+      # FIX: Use values$grouped_data_frames
+      numerator_data <- values$grouped_data_frames[[input$selected_group_for_numerator]]
+      denominator_data <- values$grouped_data_frames[[input$selected_group_for_denominator]]
       
       # Ensure there is data to work with
       if (nrow(numerator_data) == 0 || nrow(denominator_data) == 0) {
@@ -348,8 +349,11 @@ observeEvent(input$run_process, {
           p_values[i] <- NA  # Assign NA or another appropriate value
         } else {
           # Perform the t-test
-          t_test_result <- t.test(num_values, denom_values)
-          p_values[i] <- t_test_result$p.value
+          # FIX: Wrapped in try() to prevent crashing on single errors
+          try({
+            t_test_result <- t.test(num_values, denom_values)
+            p_values[i] <- t_test_result$p.value
+          }, silent = TRUE)
         }
       }
       
@@ -374,15 +378,16 @@ observeEvent(input$run_process, {
       req(input$selected_group_for_numerator, input$selected_group_for_denominator)
       
       # Define data input, makes it more readable 
-      numerator_data <- grouped_data_frames[[input$selected_group_for_numerator]]
-      denominator_data <- grouped_data_frames[[input$selected_group_for_denominator]]
+      # FIX: Use values$grouped_data_frames
+      numerator_data <- values$grouped_data_frames[[input$selected_group_for_numerator]]
+      denominator_data <- values$grouped_data_frames[[input$selected_group_for_denominator]]
       
       # Removes the fir column of the data, as it is not needed for the calculation.
       numerator_data <- numerator_data[, -1]
       denominator_data <- denominator_data[, -1]
       
-      numerator_data_means <- rowMeans(numerator_data, na.rm = TRUE) # Makes sure that the calculation is done even NA values are present. # "drop = FALSE" was removed to avoid the error message.
-      denominator_data_means <- rowMeans(denominator_data, na.rm = TRUE) # "drop = FALSE" was removed to avoid the error message.
+      numerator_data_means <- rowMeans(numerator_data, na.rm = TRUE) 
+      denominator_data_means <- rowMeans(denominator_data, na.rm = TRUE) 
       numerator_data_means <- data.frame(numerator_data_means)
       denominator_data_means <- data.frame(denominator_data_means)
       
@@ -399,7 +404,8 @@ observeEvent(input$run_process, {
       
       # Continue filtering based on lipid selection
       if (!"All" %in% input$selected_lipid) {
-        logFC <- logFC[lipid_names$group %in% input$selected_lipid, ]
+        # FIX: Use values$lipid_names
+        logFC <- logFC[values$lipid_names$group %in% input$selected_lipid, ]
       }
       
       filtered_data <- logFC
@@ -555,8 +561,9 @@ observeEvent(input$run_process, {
     reactiveP_value_all <- reactive({
       req(input$selected_group_for_numerator, input$selected_group_for_denominator)
       
-      numerator_data   <- grouped_data_frames[[input$selected_group_for_numerator]]
-      denominator_data <- grouped_data_frames[[input$selected_group_for_denominator]]
+      # FIX: Use values$grouped_data_frames
+      numerator_data   <- values$grouped_data_frames[[input$selected_group_for_numerator]]
+      denominator_data <- values$grouped_data_frames[[input$selected_group_for_denominator]]
       
       if (nrow(numerator_data) == 0 || nrow(denominator_data) == 0) return(NULL)
       
@@ -570,7 +577,9 @@ observeEvent(input$run_process, {
             any(is.na(num_values)) || any(is.na(denom_values))) {
           p_values[i] <- NA
         } else {
-          p_values[i] <- t.test(num_values, denom_values)$p.value
+          try({
+            p_values[i] <- t.test(num_values, denom_values)$p.value
+          }, silent = TRUE)
         }
       }
       
@@ -2039,9 +2048,9 @@ observeEvent(input$show_lipid_cal, {
 
 # Render the datatable of removed_data
 output$lipid_remove_table <- DT::renderDataTable({
-  req(input$show_lipid_remove) # Ensures button has been clicked
+  req(input$show_lipid_remove, values$removed_data) # Ensures button has been clicked and data exists
   DT::datatable(
-    removed_data,
+    values$removed_data,
     options = list(pageLength = 5, autoWidth = TRUE, scrollX = TRUE)
   )
 })
@@ -2158,9 +2167,6 @@ observeEvent(input$lipid_contact, {
               style = "font-family:sans-serif; font-size:22px; font-weight:bold;"
             )
           )
-          
-          
-          
           
           
           
