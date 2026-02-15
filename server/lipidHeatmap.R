@@ -6,7 +6,8 @@ values <- reactiveValues(
   runProcessClicked = FALSE,
   removed_data = NULL,
   grouped_data_frames = NULL,
-  lipid_names = NULL
+  lipid_names = NULL,
+  cleaning_stats = NULL  # <--- NEW: Stores the counts for the summary
 )
 
 
@@ -69,7 +70,7 @@ output$heatmap_name_col_ui <- renderUI({
   )
 })
 
-# If your active dataset can change, keep the choices in sync:
+# If  active dataset can change, keep the choices in sync:
 observeEvent(rv$activeFile, {
   req(rv$activeFile, rv$data[[rv$activeFile]])
   cols <- colnames(rv$data[[rv$activeFile]])
@@ -94,6 +95,36 @@ observeEvent(rv$activeFile, {
 # When button clicked in interface, all the following will be processed
 observeEvent(input$run_process, {
   
+  
+  # --- FIX START: Check if Sequence Exists ---
+  # We check three things to be safe:
+  # 1. Is there an active file selected? (rv$activeFile)
+  # 2. Is the sequence list long enough to contain this file?
+  # 3. Is the sequence data for this file actually there (not NULL)?
+  
+  has_sequence <- FALSE
+  if (!is.null(rv$activeFile) && length(rv$sequence) >= rv$activeFile) {
+    if (!is.null(rv$sequence[[rv$activeFile]])) {
+      has_sequence <- TRUE
+    }
+  }
+  
+  if (!has_sequence) {
+    # Option A: Use shinyalert (Prettier, requires useShinyalert() in UI)
+    shinyalert::shinyalert(
+      title = "Missing Sequence File",
+      text = "Please upload a sequence file (metafile) before running data processing.",
+      type = "warning"
+    )
+    
+
+    
+    return() # <--- CRITICAL: This stops the code here so it doesn't crash below!
+  }
+  # --- FIX END ---
+
+  
+  
   values$runProcessClicked <- TRUE
   
   sequence <- rv$sequence[[rv$activeFile]]
@@ -103,86 +134,73 @@ observeEvent(input$run_process, {
   req(input$heatmap_name_col)
   name_col <- input$heatmap_name_col
   
-  # Relocate the selected column to the front (column 1)
+  # Relocate and Rename
   if (name_col %in% colnames(data)) {
     data <- dplyr::relocate(data, dplyr::all_of(name_col), .before = 1)
   }
-  
-  # Rename column 1 to "Compound_Name"
-  # This satisfies your merge_duplicates function, which looks for this specific name.
   colnames(data)[1] <- "Compound_Name"
   
-  number_of_rows_before <- nrow(data)
+  # 1. CAPTURE START COUNT
+  n_start <- nrow(data)
   
   ###############
   # Data cleaning
   ###############
   
-  # Apply formatting (ensure we refer to column 1, which is now Compound_Name)
+  # Apply formatting
   data[, 1] <- sapply(data[, 1], format_strings)
   
-  # Lipid total
+  # --- FIX: Normalize Lipid Class Case (pc -> PC) ---
+  # This finds the text before the '(' and forces it to UPPERCASE.
+  data[, 1] <- sub("^([^(]+)", "\\U\\1", data[, 1], perl = TRUE)
+  
   data[, 1] <- sapply(data[, 1], make_total_name, only_if_multiple = FALSE)
   
-  # Removes noise / pattern cleaning
-  # (Uncomment your preferred cleaning functions here as needed)
+  # 2. CAPTURE & REMOVE INVALID PATTERNS
+  # Store the rows that WILL be removed (for the table)
+  values$removed_data <- remove_patterned_rows(data) 
+  n_invalid_format <- nrow(values$removed_data)
   
-  # Used to show which data is being filtered away
-  values$removed_data <- remove_patterned_rows(data)  
-  
-  # Filter rows based on pattern
+  # Filter rows (Keep only valid X(C:D) format)
   data <- filter_data_by_pattern(data)
+  n_post_clean <- nrow(data)
   
   # Initialize info object
   merged_data_info <- NULL
   
-  
   # --- STEP 2: Handle Dataset Selection (Original vs Merged) ---
+  n_merged_loss <- 0 # Default to 0
   
   if (input$selected_dataset == "original") {
-    
     data <- unique_compound_names(data)
-    
   } else if (input$selected_dataset == "merged") {
-    
-    # Creating info to display inside 'Table of Heatmap'
     merged_data_info <- merged_info_function(data)
     
-    # --- CRITICAL FIX FOR MERGING ---
-    # We need to filter the data to keep only the Name and Samples.
-    # Instead of relying on the sequence file's "Name" label (which might not match),
-    # we explicitly keep Column 1 (Compound_Name) and any column labeled "Sample".
-    
-    # Identify sample columns from the sequence file
+    # Identify sample columns
     sample_cols_indices <- which(sequence[, 'labels'] == "Sample")
-    
-    # Subset data: Keep Column 1 (Compound_Name) + Sample Columns
-    # drop=FALSE ensures it stays a data frame even if only 1 sample exists
     data <- data[, c(1, sample_cols_indices), drop = FALSE]
-    
-    # Update sequence to match the new data structure
-    # (We keep rows where label is Name or Sample to match the dataframe columns)
     sequence <- sequence[sequence[, 'labels'] %in% c("Name", "Sample"), ]
     
-    # --- RUN MERGE ---
-    # Now we can call your original function with NO extra arguments.
-    # It will find "Compound_Name" because we renamed it in Step 1.
+    # Run Merge
+    n_before_merge <- nrow(data)
     data <- merge_duplicates(data)
+    n_after_merge <- nrow(data)
+    
+    # Calculate how many rows were collapsed
+    n_merged_loss <- n_before_merge - n_after_merge
   }
   
+  # 3. CAPTURE FINAL COUNT
+  n_final <- nrow(data)
   
-  
-  
-  
-  # Capture the number of rows after filtering
-  number_of_rows_after <- nrow(data)
-  
-  # Calculate the number of rows removed
-  rows_removed <- number_of_rows_before - number_of_rows_after
-  output$rows_removed_text <- renderText({
-    paste("Rows removed after data cleaning are:", rows_removed, ". The removal is be due to the names in the first column of the data file not being in the X(C:D) format. 
-            Keep in mind, that the merged data will also count as a removed row, but they will not show up in the table down below.")
-  })
+  # SAVE STATS TO VALUES (So we can show them in the modal)
+  values$cleaning_stats <- list(
+    start = n_start,
+    invalid = n_invalid_format,
+    valid = n_post_clean,
+    merged_loss = n_merged_loss,
+    final = n_final
+  )
   
   
   # The following is used in the tab: 'Lipid summary'.
@@ -211,6 +229,18 @@ observeEvent(input$run_process, {
   observeEvent(input$run_process, {
     processed_results <- process_lipid_data(sequence, data)
     values$grouped_data_frames <- create_grouped_data_frames(sequence, data)
+    
+    # --- FIX START: Stop if no matching data found ---
+    if (is.null(values$grouped_data_frames) || length(values$grouped_data_frames) == 0) {
+      shinyalert::shinyalert(
+        title = "Data Mismatch",
+        text = "Could not group data. Please check if you have uploade Sequences file, or if your Sequence file matches the column names in your Data file.",
+        type = "error"
+      )
+      values$runProcessClicked <- FALSE # Reset the button state
+      return() # Stop here to prevent the crash
+    }
+    # --- FIX END ---
     
     compound_names <- data[[1]]  # Extract the first column which contains compound names
     
@@ -1183,7 +1213,8 @@ observeEvent(input$run_process, {
             plotOutput(
               "heatmapPlot",
               width  = paste0(plot_w, "px"),
-              height = paste0(plot_h, "px")
+              height = paste0(plot_h, "px"),
+              click = "heatmap_click"
             )
           )
         )
@@ -1302,8 +1333,89 @@ observeEvent(input$run_process, {
     })
     
     
+
     
-    
+    observeEvent(input$heatmap_click, {
+      # 1. Get the clicked coordinates
+      click <- input$heatmap_click
+      
+      # Return early if clicked outside or no plot exists
+      if (is.null(click$x) || is.null(click$y)) return()
+      
+      # 2. Fetch the fully processed data DIRECTLY from the plot object
+      # This ensures we have 'Carbon', 'Double', and 'FacetClass' columns
+      plot_result <- heatmap_plot_data()
+      req(plot_result$plot$data)
+      plot_df <- plot_result$plot$data
+      
+      # 3. Match the click to the data
+      # Round coordinates because Carbon/Double are integers on the axis
+      clicked_carbon <- round(click$x)
+      clicked_double <- round(click$y)
+      
+      # Handle Facets: ggplot sends the facet value in 'panelvar1'
+      clicked_facet  <- click$panelvar1
+      
+      # Find the specific lipid
+      selected_lipid <- plot_df %>%
+        dplyr::filter(
+          Carbon == clicked_carbon,
+          Double == clicked_double,
+          # Only filter by facet if the click contains facet info (it usually does for faceted plots)
+          if (!is.null(clicked_facet)) FacetClass == clicked_facet else TRUE
+        )
+      
+      # If a unique lipid is found, show the modal
+      if (nrow(selected_lipid) == 1) {
+        lipid_name <- selected_lipid$Compound_Name
+        
+        # 4. Retrieve Raw Data for this lipid from the grouped data frames
+        num_group <- input$selected_group_for_numerator
+        den_group <- input$selected_group_for_denominator
+        
+        # Helper to extract values for a specific lipid from a group dataframe
+        get_values <- function(group_name, lipid) {
+          # Access the reactive value containing the grouped data
+          df <- values$grouped_data_frames[[group_name]]
+          
+          # Find row with this lipid
+          row_idx <- which(df$Compound_Name == lipid)
+          
+          if (length(row_idx) > 0) {
+            # Extract numeric values (excluding Compound_Name at col 1)
+            val <- as.numeric(df[row_idx, -1]) 
+            return(data.frame(Group = group_name, Abundance = val))
+          }
+          return(NULL)
+        }
+        
+        df_num <- get_values(num_group, lipid_name)
+        df_den <- get_values(den_group, lipid_name)
+        plot_data <- rbind(df_num, df_den)
+        
+        # 5. Render the Modal
+        showModal(modalDialog(
+          title = paste("Detail View:", lipid_name),
+          renderPlot({
+            req(plot_data)
+            ggplot(plot_data, aes(x = Group, y = Abundance, fill = Group)) +
+              geom_boxplot(alpha = 0.6, outlier.shape = NA) +
+              geom_jitter(width = 0.2, size = 2) +
+              theme_minimal(base_size = 14) +
+              labs(
+                title = paste0("LogFC: ", round(selected_lipid$logFC, 3), 
+                               " | p-adj: ", formatC(selected_lipid$padj, format = "e", digits = 2)),
+                subtitle = paste("Carbon:", selected_lipid$Carbon, "| Double Bonds:", selected_lipid$Double),
+                y = "Abundance (Intensity)"
+              ) +
+              scale_fill_manual(values = c(input$high_color, input$low_color)) 
+          }),
+          size = "m",
+          easyClose = TRUE,
+          footer = modalButton("Close")
+        ))
+      }
+    })
     
     
     
@@ -1343,12 +1455,10 @@ observeEvent(input$run_process, {
       filtered_data <- reactiveFilteredData()
       req(data)  # We must have data
       
-      # If 'merged_data_info' is required only in "merged" scenario, don't use req(merged_data_info)
-      # Instead, just check if it's not NULL before merging later.
-      
       # Ensure 'Compound_Name' exists in 'data'
       if (!"Compound_Name" %in% colnames(data)) {
-        data$Compound_Name <- data[, 1]  # Assuming the first column contains compound names
+        # FIX: Use [[1]] to get a vector, avoiding tibble/dataframe nested column issues
+        data$Compound_Name <- data[[1]]  
       }
       
       # Ensure 'Compound_Name' exists in 'filtered_data'
@@ -1450,11 +1560,22 @@ observeEvent(input$run_process, {
     observeEvent(input$download_heatmap_btn, {
       showModal(modalDialog(
         title = "Download Heatmap Image",
-        # --- NEW: Text input for file name ---
+        
+        # File Name Input
         textInput("modal_file_name", "Enter File Name", value = paste0("lipid_heatmap_", Sys.Date())),
         
+        # Format Selection
         selectInput("modal_image_format", "Select Image Format", choices = c("PNG" = "png", "PDF" = "pdf", "JPEG" = "jpeg")),
-        numericInput("modal_image_dpi", "Image Resolution (DPI)", value = 300, min = 72, step = 72),
+        
+        # --- UI CHANGE START ---
+        # 1. Add 'max = 600' so the spinner stops there.
+        numericInput("modal_image_dpi", "Image Resolution (DPI)", value = 300, min = 72, max = 600, step = 72),
+        
+        # 2. Add a helpful note so the user sees the difference immediately.
+        tags$p(style = "color: #888; font-size: 12px; margin-top: -10px;", 
+               "Note: Maximum resolution for PNG/JPEG is 600 DPI."),
+        # --- UI CHANGE END ---
+        
         footer = tagList(
           modalButton("Cancel"),
           downloadButton("modal_download_heatmap", "Download")
@@ -1462,7 +1583,34 @@ observeEvent(input$run_process, {
       ))
     })
     
+    # ---- FIX: STRICT INPUT ENFORCEMENT ----
+    # This observer watches what the user types. 
+    # If they go above 600 for PNG/JPEG, it forces the number back down.
     
+    observeEvent(c(input$modal_image_dpi, input$modal_image_format), {
+      # Only run if the modal is open and input exists
+      req(input$modal_image_dpi)
+      
+      # Define the safety limit
+      max_safe_dpi <- 600
+      
+      # Check if we need to enforce the limit (Raster images only)
+      is_vector <- tolower(input$modal_image_format) %in% c("pdf", "svg")
+      
+      if (!is_vector && input$modal_image_dpi > max_safe_dpi) {
+        
+        # 1. Snap the value back to 600 immediately
+        updateNumericInput(session, "modal_image_dpi", value = max_safe_dpi)
+        
+        # 2. Show a polite, transient warning so they know why it changed
+        showNotification(
+          paste("Resolution capped at", max_safe_dpi, "DPI for this format."), 
+          type = "warning", 
+          duration = 3
+        )
+      }
+    })
+    # ---------------------------------------
     
     
     
@@ -1484,14 +1632,27 @@ observeEvent(input$run_process, {
         
         dims <- plot_dimensions()
         
-        dpi <- if (!is.null(input$modal_image_dpi) &&
-                   !is.na(input$modal_image_dpi) &&
-                   input$modal_image_dpi > 0) {
+
+        # 1. Get the user's desired DPI
+        user_dpi <- if (!is.null(input$modal_image_dpi) &&
+                        !is.na(input$modal_image_dpi) &&
+                        input$modal_image_dpi > 0) {
           input$modal_image_dpi
         } else {
           300
         }
         
+        # 2. Apply limits based on file type
+        # If it is a Raster image (PNG, JPEG), we cap it at 600 DPI to prevent server crashes.
+        # If it is a Vector image (PDF, SVG), we allow the user's input (or default to 300) 
+        # because vectors are math-based and won't consume RAM like pixels do.
+        
+        if (tolower(input$modal_image_format) %in% c("pdf", "svg")) {
+          dpi <- user_dpi 
+        } else {
+          dpi <- min(user_dpi, 600) # <--- THE SAFETY CAP
+        }
+
         ggsave(
           filename = file,
           plot     = plot,
@@ -1976,6 +2137,37 @@ observeEvent(input$run_process, {
   })
 }) # This finishes the first 'observeEvent' when 'Run data processing' is clicked
 
+
+# Generate a nice summary table for the modal
+output$cleaning_summary_ui <- renderUI({
+  req(values$cleaning_stats)
+  stats <- values$cleaning_stats
+  
+  # Calculate percentages
+  pct_invalid <- round((stats$invalid / stats$start) * 100, 1)
+  pct_final   <- round((stats$final / stats$start) * 100, 1)
+  
+  tagList(
+    h4("Data Processing Statistics"),
+    HTML(paste0(
+      "<table class='table table-condensed' style='width:100%; font-size:14px;'>",
+      "<tr style='background-color: #f9f9f9;'><td><strong>Total Imported Rows</strong></td><td style='text-align:right;'><strong>", stats$start, "</strong></td></tr>",
+      
+      "<tr><td>Rows Removed (Invalid Format)</td><td style='text-align:right; color:red;'>-", stats$invalid, " (", pct_invalid, "%)</td></tr>",
+      
+      "<tr><td><i>Rows Remaining after Cleaning</i></td><td style='text-align:right;'>", stats$valid, "</td></tr>",
+      
+      # Only show merge loss if it actually happened
+      if(stats$merged_loss > 0) {
+        paste0("<tr><td>Rows Collapsed (Isobaric Merging)</td><td style='text-align:right; color:orange;'>-", stats$merged_loss, "</td></tr>")
+      } else { "" },
+      
+      "<tr style='border-top: 2px solid #333; background-color: #e6eef7;'><td><strong>Final Rows Available</strong></td><td style='text-align:right;'><strong>", stats$final, " (", pct_final, "%)</strong></td></tr>",
+      "</table>"
+    ))
+  )
+})
+
 # Outside of the observeEvent, based on whether runProcessClicked is TRUE or FALSE, the message display will be placed on this: 
 # For the first message, which is placed in the 'Lipid Heatmap' tab.
 output$table_message_1 <- renderUI({
@@ -2055,12 +2247,22 @@ output$lipid_remove_table <- DT::renderDataTable({
   )
 })
 
-# Show the modal dialog containing the table when button is pressed
+# Show the "Wise" modal dialog
 observeEvent(input$show_lipid_remove, {
   showModal(modalDialog(
-    title = "Lipid filtration summeray",
-    textOutput("rows_removed_text"),
-    dataTableOutput("lipid_remove_table"),
+    title = "Lipid Filtration Summary", # Fixed spelling
+    size = "l",                         # Made it 'large' to fit content better
+    
+    # 1. The new wise summary table
+    uiOutput("cleaning_summary_ui"),
+    
+    hr(),
+    
+    # 2. The details of what was removed
+    h4("Details: Rows Removed (Invalid Format)"),
+    p("The following rows were removed because their names in the first column did not match the required 'Class(C:D)' format (e.g., 'PC(34:1)')."),
+    DT::dataTableOutput("lipid_remove_table"),
+    
     easyClose = TRUE,
     footer = modalButton("Close")
   ))

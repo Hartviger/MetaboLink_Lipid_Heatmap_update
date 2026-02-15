@@ -8,6 +8,7 @@ body <- dashboardBody(
   tags$head(tags$style(".modal-sm{ width:300px}
                        .modal-lg{ width:1200px}")),
   useShinyjs(),
+  useShinyalert(),  # <--- ADD THIS LINE HERE
 
   fluidRow(hidden(div(
     id = "buttons", style = "padding-bottom: 49px",
